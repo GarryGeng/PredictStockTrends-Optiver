@@ -1,0 +1,103 @@
+---
+title: "W7"
+output: html_document
+date: "2023-04-02"
+---
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(viridis)
+library(colorspace)
+library(knitr)
+```
+
+```{r}
+set.seed(3888)
+stock0 = read.csv('data/Optiver/individual_book_train/stock_0.csv')
+
+# Get all time IDs
+buckets = unique(stock0$time_id)
+
+# Get all files
+files = list.files(path='data/Optiver/individual_book_train')
+#files = c('stock_120.csv')
+
+# Determine random time IDs
+buckets_to_choose = sample(buckets, 20)
+```
+
+```{r}
+# Setup data frame
+data = data.frame(matrix(NA, nrow = 1, ncol = 20*2))
+for (i in 1:length(files)) {
+  file = files[i]
+  file = paste('data/Optiver/individual_book_train/', file, sep='', collapse='')
+  print(file)
+  stock = read.csv(file)
+  
+  # Get WAP & Quoted Volume
+  stock = mutate(stock, WAP = (bid_price1 * ask_size1 + ask_price1 * bid_size1)/(ask_size1 + bid_size1))
+  stock = mutate(stock, quoted_volume = ask_size1 + ask_size2 + bid_size1 + bid_size2)
+  
+  # Calculate Log Returns
+  log_ret <- list()
+  for (i in 1 : length(buckets_to_choose)) {
+    sec <- stock %>% filter(time_id == buckets_to_choose[i]) %>% pull(seconds_in_bucket)
+    price <- stock %>% filter(time_id == buckets_to_choose[i]) %>% pull(WAP)
+    log_r <- log(price[-1] / price[1:(length(price) - 1)])
+    log_ret[[i]] <- data.frame(time = sec[-1], log_return = log_r)
+    time.no.change <- (1:600)[!(1:600 %in% log_ret[[i]]$time)]
+    if (length(time.no.change) > 0) {
+      new.df <- data.frame(time = time.no.change, log_return = 0)
+      log_ret[[i]] <- rbind(log_ret[[i]], new.df)
+      log_ret[[i]] <- log_ret[[i]][order(log_ret[[i]]$time), ]
+    }
+  }
+  
+  # Calculate Volatilities
+  temp_df = data.frame(matrix(NA, nrow = 1, ncol = 20))
+  for (i in 1:length(log_ret)) {
+    if (i %% 10 == 0) {
+      print(i)
+    }
+  #for (i in 1:10) {
+    index = i
+    vols = list()
+    for (j in 1:20) {
+      x = (j-1) * 30
+      window = data.frame(log_ret[i]) %>% filter(time > x & time <= x + 30)
+      vol = sd(window$log_return)
+      vols = append(vols, vol)
+    }
+    
+    temp_df[nrow(temp_df) + 1,] = vols
+    colnames(temp_df) = 1:20
+  }
+  
+  # Get volumes
+  volumes = list()
+  for (i in 1:length(buckets_to_choose)) {
+    volume = stock %>% filter(time_id == buckets_to_choose[i]) %>% pull(quoted_volume) 
+    volumes = append(volumes, mean(volume))
+  }
+  
+  temp_df = temp_df %>%  na.omit()
+  rownames(temp_df) = buckets_to_choose
+  temp_df$mean = rowMeans(temp_df)
+  
+  # Put into global DF
+  row = c(temp_df$mean, volumes)
+  data[nrow(data) + 1,] = row
+}
+
+data = data %>%  na.omit()
+rownames(data) = files
+colnames(data) = c(paste0('Volatility', 1:20), paste0('Volume', 1:20))
+```
+
+```{r}
+head(data)
+write.csv(data, "./data.csv")
+```
+

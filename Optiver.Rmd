@@ -1,0 +1,136 @@
+---
+title: "Optiver"
+author: "Optiver-10"
+date: "2023-03-26"
+output: html_document
+---
+```{r warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(rugarch)
+stock_37 <- read.csv('./individual_book_train/stock_37.csv')
+```
+
+```{r}
+set.seed(3888)
+# Get 20% time_id data from stock
+unique_time_ids <- unique(stock_37$time_id)
+sample_time_ids <- sample(unique_time_ids, round(length(unique_time_ids) * 0.2))
+stock_37 <- stock_37[stock_37$time_id %in% sample_time_ids,]
+
+stock_37 <- stock_37 %>% mutate(WAP = (bid_price1 * ask_size1 + ask_price1 * bid_size1) / (bid_size1 + ask_size1))
+stock_37 <- stock_37 %>% mutate(BidAskSpread = ask_price1 / bid_price1 - 1)
+
+logR_wap <- list()
+time_IDs <- sample_time_ids
+for (i in 1 : length(time_IDs)) {
+  sec <- stock_37 %>% filter(time_id == time_IDs[i]) %>% pull(seconds_in_bucket)
+  price <- stock_37 %>% filter(time_id == time_IDs[i]) %>% pull(WAP)
+  log_r <- log(price[-1] / price[1:(length(price) - 1)])
+  logR_wap[[i]] <- data.frame(time = sec[-1], log_return = log_r, WAP = price[-1])
+  time.no.change <- (1:600)[!(1:600 %in% logR_wap[[i]]$time)]
+  if (length(time.no.change) > 0) {
+    new.df <- data.frame(time = time.no.change, log_return = 0, WAP = NA)
+    logR_wap[[i]] <- rbind(logR_wap[[i]], new.df)
+    logR_wap[[i]] <- logR_wap[[i]][order(logR_wap[[i]]$time), ]
+  }
+}
+
+vol <- list()
+tmp <- list()
+comp_vol <- function(x) {
+  return(sqrt(sum(x ^ 2)))
+}
+for (i in 1 : length(logR_wap)) {
+  logR_wap[[i]] <- logR_wap[[i]] %>% mutate(time_bucket = ceiling(time / 30))
+  vol[[i]] <- aggregate(log_return ~ time_bucket, data = logR_wap[[i]], FUN = comp_vol)
+  colnames(vol[[i]]) <- c('time_bucket', 'volatility')
+  tmp <- aggregate(WAP ~ time_bucket, data = logR_wap[[i]], FUN = function(x) mean(x, na.rm = TRUE))
+  colnames(vol[[i]]) <- c('time_bucket','WAP')
+  vol[[i]] <- merge(vol[[i]], tmp, by = 'time_bucket')
+  colnames(vol[[i]]) <- c('time_bucket', 'volatility', 'WAP')
+  tmp <- aggregate(log_return ~ time_bucket, data = logR_wap[[i]], FUN = function(x) mean(x, na.rm = TRUE))
+  vol[[i]] <- merge(vol[[i]], tmp , by = 'time_bucket')
+  colnames(vol[[i]]) <- c('time_bucket', 'volatility', 'WAP', 'log_ret')
+}
+
+# Remove unused element
+rm(new.df)
+rm(tmp)
+rm(i)
+rm(log_r)
+rm(price)
+rm(sample_time_ids)
+rm(sec)
+rm(time_IDs)
+rm(time.no.change)
+rm(unique_time_ids)
+rm(comp_vol)
+
+ggplot(data = logR_wap[[1]], aes(x = time, y = log_return)) + geom_line() 
+
+ggplot(data = vol[[1]], aes(x = time_bucket, y = volatility)) + geom_line() + geom_point() 
+```
+
+
+# 0. Baseline Model
+
+## 0.1 Linear regression model
+Linear regression is a basic statistical modeling method that can be used to predict the relationship between one variable and other variables. In the finance industry, linear regression is commonly used to predict stock prices, exchange rates, and other market indicators.
+So we will first user this model to get some visual result
+
+### 0.1.1 Simple linear regression model
+
+It can quickly and intuitively provide us with visual prediction. 
+
+```{r}
+set.seed(3888)
+# Divide data into 'train/test_data' set
+vol_df <- do.call(rbind, vol)
+
+train_size <- round(length(vol_df) * 0.7)
+train_indices <- sample(seq_len(length(vol_df)), size = train_size)
+train_data <- vol_df[train_indices, ]
+test_data <- vol_df[-train_indices, ]
+
+# Contract the simple linear regression model for 'Volatility&WAP'
+model_VW <- lm(volatility ~ WAP, data = train_data)
+
+# Contract the simple linear regression model for 'Volatility&time_bucket'
+model_VT <- lm(volatility ~ time_bucket, data = train_data)
+
+# Contract the simple linear regression model for 'Volatility&log_return'
+model_VL <- lm(volatility ~ log_ret, data = train_data)
+
+# Test the model build
+predictions_VM <- predict(model_VW, newdata = test_data)
+RMSE_VM <- sqrt(mean((test_data$volatility - predictions_VM) ^ 2))
+
+predictions_VT <- predict(model_VT, newdata = test_data)
+RMSE_VT <- sqrt(mean((test_data$volatility - predictions_VT) ^ 2))
+
+predictions_VL <- predict(model_VL, newdata = test_data)
+RMSE_VL <- sqrt(mean((test_data$volatility - predictions_VL) ^ 2))
+
+# RMSE
+cat(sprintf(" 'Volatility&WAP' RMSE:%.4f\n", RMSE_VM))
+cat(sprintf(" 'Volatility&time_bucket' RMSE:%.4f\n", RMSE_VT))
+cat(sprintf(" 'Volatility&log_return' RMSE:%.4f\n", RMSE_VL))
+```
+
+
+
+### 0.1.2 Multiple linear regression model
+
+Compared to simple linear regression models, there are more independent variables involved. Through optimizing and validating the model parameters, better prediction results can be achieved.
+
+
+```{r}
+set.seed(3888)
+
+model_M <- lm(volatility ~ WAP + log_ret, data = train_data)
+predictions_M <- predict(model_M, newdata = test_data)
+RMSE_M <- sqrt(mean((test_data$volatility - predictions_M) ^ 2))
+
+cat(sprintf(" 'M' RMSE:%.4f\n", RMSE_M))
+```

@@ -1,0 +1,469 @@
+---
+title: "W11"
+output: html_document
+date: "2023-04-02"
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(tidyverse)
+library(viridis)
+library(colorspace)
+library(knitr)
+library(FNN)
+library(caret)
+library(rugarch)
+library(quarks)
+options(warn=-1)
+```
+
+```{r}
+# SETUP WITH BUCKET NAMES
+set.seed(3888)
+stock0 = read.csv('./individual_book_train/stock_0.csv')
+
+# Get all time IDs
+buckets = unique(stock0$time_id)
+
+# Get all files
+files = list.files(path='./individual_book_train')
+```
+
+
+```{r}
+# CLUSTERING
+set.seed(3888)
+# Determine random time IDs
+number_of_time_IDs = 40
+buckets_to_choose = sample(buckets, number_of_time_IDs)
+
+# Setup data frame
+data = data.frame(matrix(NA, nrow = 1, ncol = number_of_time_IDs*3))
+for (i in 1:length(files)) {
+  file = files[i]
+  file = paste('./individual_book_train/', file, sep='', collapse='')
+  print(file)
+  stock = read.csv(file)
+  
+  # Get WAP & Quoted Volume
+  stock = mutate(stock, WAP = (bid_price1 * ask_size1 + ask_price1 * bid_size1)/(ask_size1 + bid_size1))
+  stock = mutate(stock, quoted_volume = ask_size1 + ask_size2 + bid_size1 + bid_size2)
+  
+  # Calculate Log Returns
+  log_ret <- list()
+  for (i in 1 : length(buckets_to_choose)) {
+    sec <- stock %>% filter(time_id == buckets_to_choose[i]) %>% pull(seconds_in_bucket)
+    price <- stock %>% filter(time_id == buckets_to_choose[i]) %>% pull(WAP)
+    log_r <- log(price[-1] / price[1:(length(price) - 1)])
+    log_ret[[i]] <- data.frame(time = sec[-1], log_return = log_r)
+    time.no.change <- (1:600)[!(1:600 %in% log_ret[[i]]$time)]
+    if (length(time.no.change) > 0) {
+      new.df <- data.frame(time = time.no.change, log_return = 0)
+      log_ret[[i]] <- rbind(log_ret[[i]], new.df)
+      log_ret[[i]] <- log_ret[[i]][order(log_ret[[i]]$time), ]
+    }
+  }
+  
+  # Calculate Volatilities
+  temp_df = data.frame(matrix(NA, nrow = 1, ncol = number_of_time_IDs))
+  #for (i in 1:length(log_ret)) {
+  #  if (i %% 50 == 0) {
+  #    print(i)
+  #  }
+  #for (i in 1:10) {
+    index = i
+    vols = list()
+    for (j in 1:number_of_time_IDs) {
+      x = (j-1) * 30
+      window = data.frame(log_ret[i]) %>% filter(time > x & time <= x + 30)
+      vol = sd(window$log_return)
+      vols = append(vols, vol)
+    }
+    
+    temp_df[nrow(temp_df) + 1,] = vols
+    colnames(temp_df) = 1:number_of_time_IDs
+  
+  # Get volumes
+  volumes = list()
+  for (i in 1:length(buckets_to_choose)) {
+    volume = stock %>% filter(time_id == buckets_to_choose[i]) %>% pull(quoted_volume) 
+    volumes = append(volumes, mean(volume))
+  }
+  
+  temp_df = temp_df %>%  na.omit()
+  #rownames(temp_df) = buckets_to_choose
+  temp_df$mean = rowMeans(temp_df)
+  
+  # Get WAPs
+  waps = list()
+  for (i in 1:length(buckets_to_choose)) {
+    wap = stock %>% filter(time_id == buckets_to_choose[i]) %>% pull(WAP) 
+    waps = append(waps, mean(wap))
+  }
+  
+  # Put into global DF
+  row = c(temp_df$mean, volumes, waps)
+  data[nrow(data) + 1,] = row
+}
+
+data = data %>%  na.omit()
+rownames(data) = files
+colnames(data) = c(paste0('Volatility', 1:number_of_time_IDs), paste0('Volume', 1:number_of_time_IDs), paste0('WAP', 1:number_of_time_IDs))
+
+normalize_data = function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))
+}
+
+# Normalize each column in the data frame
+data_to_cluster = data[c(paste0('Volatility', 1:20), paste0('Volume', 1:20))]
+data_to_cluster = as.data.frame(lapply(data_to_cluster, normalize_data))
+
+k = 5
+kmeans_result = kmeans(data_to_cluster, centers = k, iter.max = 500)
+
+data$Cluster = kmeans_result$cluster
+
+row_names = rownames(data)
+clusters = data.frame(row.names = row_names, Clusters = data$Cluster)
+table(clusters)
+```
+
+```{r}
+write.csv(data, "./clustered_data.csv", row.names=TRUE)
+```
+
+```{r}
+# GARCH
+GARCH_model <- function(train = train_data, n_ahead) {
+    
+  train <- train[complete.cases(train$log_r), ]
+
+     spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)), mean.model = list(armaOrder = c(1, 1)), distribution.model = "norm")
+
+     model <- ugarchfit(spec = spec, data = train$log_r, solver = 'hybrid')
+
+     forecast <- ugarchforecast(model, n.ahead = n_ahead)
+
+  predicted_volatility <- forecast@forecast$sigmaFor
+
+     return(predicted_volatility)
+
+}
+```
+
+
+```{r}
+#EWMA
+ewma_model = function(stockdata, lambda=0.2, train_percentage=100) {
+  
+  ## process stock data ##
+  
+  # filter for a particular time id 
+  stock <- stockdata
+  
+  #separate into time buckets
+  sec <- stock %>% pull(seconds_in_bucket)
+  stock <- stock %>% mutate(time_bucket = ceiling(sec/30))
+  
+  unique_buckets <- unique(stock$time_bucket)
+  
+  # compute log return for each time bucket
+  log_returns <- data.frame()
+  
+  for(i in 1:(length(unique_buckets)-1)){
+    # get first and last WAP of each interval
+    wap1 <- stock %>% filter(time_bucket == i) %>% head(1) %>% pull(WAP)
+    wap2 <- stock %>% filter(time_bucket == i) %>% tail(1) %>% pull(WAP)
+    
+    log_r <- log(wap1 / wap2)
+    
+    # update df
+    new_row <- data.frame(bucket=i, log_return=log_r)
+    log_returns <- rbind(log_returns, new_row)
+  }
+  
+  # compute volatility per bucket for this time id 
+  comp_vol <- function(x) {return(sqrt(sum(x ^ 2)))}
+  sec <- stock %>% pull(seconds_in_bucket) # vector of all seconds in bucket
+  log.r <- data.frame(time = sec[-1], 
+                      log_return = log(stock$WAP[-1] / stock$WAP[-length(stock$WAP)]))
+  log.r <- log.r %>% mutate(time_bucket = ceiling(time / 30))
+  vol <- aggregate(log_return ~ time_bucket, data = log.r, FUN = comp_vol)
+  colnames(vol) <- c('time_bucket', 'volatility')
+  
+  ## prediction ##
+  
+  train_ratio = train_percentage/100
+  train_size = dim(log_returns)[1] * train_ratio
+  x_train = head(log_returns, train_size)
+  
+  test_idx = train_size + 1
+  
+  vol_vector <- quarks::ewma(x_train$log_return, lambda=lambda)
+  
+  # final_prediction is the final EWMA calculated from the input return series 
+  final_prediction <- vol_vector[train_size]
+
+  return(final_prediction) # returns predicted volatility and accuracy measure
+}
+```
+
+```{r}
+# HISVOL GARCH
+HISVAL_GARCH <- function(log_return) {
+
+N <- 100
+
+if (length(log_return) < N) {
+
+N <- length(log_return)
+
+}
+
+log_return_squared <- log_return^2
+
+sigma_values <- sqrt(rollapply(log_return_squared, N, mean, align="right", na.rm = TRUE))
+
+sigma_values <- c(rep(NA, N-1), sigma_values)
+
+garch_spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+
+mean.model = list(armaOrder = c(0, 0), include.mean = TRUE),
+
+distribution.model = "norm")
+
+garch_fit <- ugarchfit(spec = garch_spec, data = log_return, solver = "hybrid", solver.control = list(tol = 1e-08, maxiter = 2000))
+
+garch_forecast <- ugarchforecast(garch_fit, n.ahead = 1)
+
+hisvol_forecast <- mean(tail(sigma_values, N), na.rm = TRUE)
+
+lambda <- 0.5
+
+hisvol_garch_forecast <- lambda * hisvol_forecast + (1 - lambda) * as.numeric(garch_forecast@forecast$sigmaFor)
+
+return(hisvol_garch_forecast)
+
+}
+
+
+
+hisval_garch_predict <- function(data,id){
+
+data <- data %>% mutate(
+
+WAP = (bid_price1 * ask_size1 + ask_price1 * bid_size1) / (bid_size1 + ask_size1))
+
+data <- data %>% mutate(BidAskSpread = ask_price1 / bid_price1 - 1)
+
+log_r1 <- list()
+
+time_IDs <- unique(data[, 1])[id]
+
+for (i in 1 : length(time_IDs)) {
+
+sec <- data %>% filter(time_id == time_IDs[i]) %>% pull(seconds_in_bucket)
+
+price <- data %>% filter(time_id == time_IDs[i]) %>% pull(WAP)
+
+log_r <- log(price[-1] / price[1:(length(price) - 1)])
+
+log_r1[[i]] <- data.frame(time = sec[-1], log_return = log_r)
+
+time.no.change <- (1:600)[!(1:600 %in% log_r1[[i]]$time)]
+
+if (length(time.no.change) > 0) {
+
+new.df <- data.frame(time = time.no.change, log_return = 0)
+
+log_r1[[i]] <- rbind(log_r1[[i]], new.df)
+
+log_r1[[i]] <- log_r1[[i]][order(log_r1[[i]]$time), ]
+
+}
+
+}
+
+comp_vol <- function(x) {
+
+return(sqrt(sum(x ^ 2)))
+
+}
+
+vol_timeid <- data.frame(time_id = integer(0), comp_vol = numeric(0), HISVAL_GARCH = numeric(0))
+
+for (i in 1 : length(log_r1)) {
+
+current_time_id <- time_IDs[i]
+
+current_comp_vol <- comp_vol(log_r1[[i]]$log_return)
+
+current_HISVAL_GARCH <- HISVAL_GARCH(log_r1[[i]]$log_return)
+
+vol_timeid <- rbind(vol_timeid, data.frame(time_id = current_time_id, comp_vol = as.numeric(current_comp_vol), HISVAL_GARCH = as.numeric(current_HISVAL_GARCH)))
+
+}
+
+vol_timeid$RMSE <- apply(vol_timeid[,2:3], 1, function(x) sqrt(mean((x[1] - x[2])^2)))
+
+return(vol_timeid)
+
+}
+
+
+
+hisval_garch_predict(data0,13)
+```
+
+```{r}
+regression_model = function(train_data,test_data) {
+  # Contract the simple linear regression model for 'Volatility&log_return'
+  model_VL <- lm(volatility ~ log_ret, data = train_data)
+  predictions_VL <- predict(model_VL, newdata = test_data)
+  RMSE_VL <- sqrt(mean((test_data$volatility - predictions_VL) ^ 2))
+  
+  # Contract the multiple linear regression model for 'Volatility&log_return'
+  model_M <- lm(volatility ~ WAP + log_ret, data = train_data)
+  predictions_M <- predict(model_M, newdata = test_data)
+  RMSE_M <- sqrt(mean((test_data$volatility - predictions_M) ^ 2))
+  return(predictions_VL,predictions_M) # returns predicted volatility and accuracy measure
+}
+
+regression_model(train_data,test_data)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+####################
+# MODEL PREDICTION #
+####################
+set.seed(3888)
+clustering_time_buckets = sample(buckets, 50)
+
+performance = data.frame(matrix(NA, nrow = 1, ncol = 4))
+
+comp_vol <- function(x) {
+  return(sqrt(sum(x ^ 2)))
+}
+
+# HOW MANY LOOPS - debug I suggest 1-5, if want to run the whole thing, remove the two break_count loops
+break_after = 107
+
+break_count = 0
+for (x in unique(clusters$Clusters)) {
+  files = rownames(clusters %>% filter(Clusters == x))
+  print('-----')
+  print(x)
+  
+  # DEBUGGING
+  if (break_count > 1) {
+     break 
+  }
+  #####
+  
+  for (y in 1:length(files)) {
+    # DEBUGGING
+    break_count = break_count + 1
+    if (break_count > 1) {
+     break 
+    }
+    #####
+    
+    # Read in file
+    file = files[y]
+    file = paste('./individual_book_train/', file, sep='', collapse='')
+    data_clean = read.csv(file)
+    
+    print(file)
+    
+    # ADD ANY DATA MUTATIONS HERE
+    data_clean = mutate(data_clean, WAP = (bid_price1 * ask_size1 + ask_price1 * bid_size1)/(ask_size1 + bid_size1))
+    
+    # GET DATA ALL 0-599 SECONDS
+    r2_avgs = c()
+    rmse_avgs = c()
+    log_ret <- list()
+    for (j in 1:length(clustering_time_buckets)) {
+      data = data_clean %>% filter(time_id == clustering_time_buckets[j])
+      for (i in 1:599) {
+        if (dim(data %>% filter(seconds_in_bucket==i))[[1]] == 0) {
+          dat = data %>% filter(seconds_in_bucket==(i-1))
+          dat$seconds_in_bucket = i
+          data = rbind(data, dat)
+        }
+      }
+    
+      data = data %>% arrange(seconds_in_bucket)
+      window_size = 120 # 2 min to start
+      skip = 30 # 30 second increments
+      
+      # Add column with the WAP over the interval length so at time T-interval
+      interval = 30
+      data <- data %>%
+        group_by(time_id) %>%
+        mutate(WAP_lag = lag(WAP, n = interval, default = first(WAP)),
+        WAP_ns_earlier = ifelse(seconds_in_bucket < interval, NA, WAP_lag))
+    
+      # Calculate log returns over interval
+      data$log_r <- log(data$WAP/data$WAP_ns_earlier)
+      
+      # Calculate volatility
+      volatility <- comp_vol(data$log_r)
+      data$volatility[data$time_id == clustering_time_buckets[j]] <- volatility
+      
+      ts_cv = createTimeSlices(1:nrow(data), initialWindow = window_size, skip = skip, fixedWindow = FALSE)
+      
+      # Segment the data and train/test
+      r2 = c()
+      rmse = c()
+      for(i in 1:length(ts_cv[[1]])){
+        train_index = ts_cv[[1]][[i]]
+        test_index = seq(train_index[[length(train_index)]] + 1, min(train_index[[length(train_index)]] + skip, dim(data)[[1]]))
+        
+        train_data = data[train_index, ]
+        test_data = data[test_index, ]
+        
+        # FILL IN HERE WITH MODEL
+        # Input is train_data - this is the dataframe with all of the training data including log returns, WAP and the normal columns. Has been segmented by both time and bucket so no need to handle anything in that realm, just purely prediction.
+        #predictions = ewma_model(stockdata = train_data)
+        
+        predictions = GARCH_model(train = train_data, n_ahead = length(test_data$log_r))
+        
+        # MODEL TO BE REPLACED - FOR DEBUGGING ONLY
+        #predictions = rep(test_data$log_r)
+        
+        # Accuracy Measures
+        test_data = test_data[complete.cases(test_data$log_r), ]
+
+        r2_calc = cor(predictions, test_data$log_r)^2
+        
+        MSE = mean((test_data$log_r - predictions)^2)
+        rmse_calc = sqrt(MSE)
+        
+        r2 = c(r2, r2_calc)
+        rmse = c(rmse, rmse_calc)
+        
+      }
+      r2_avgs = c(r2_avgs, mean(r2, na.rm = TRUE))
+      rmse_avgs = c(rmse_avgs, mean(rmse))
+      
+    }
+
+    row = c(x, file, mean(r2_avgs, na.rm = TRUE), mean(rmse_avgs))
+    performance[nrow(performance) + 1,] = row
+  }
+  colnames(performance) = c('Cluster', 'Stock', 'R2', 'RMSE')
+}
+```
+
+```{r}
+head(performance)
+```
+
+```{r}
+write.csv(performance, "./data_results.csv", row.names=TRUE)
+```
+
+
+
+
